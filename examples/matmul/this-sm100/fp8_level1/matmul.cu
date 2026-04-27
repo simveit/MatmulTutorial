@@ -597,7 +597,6 @@ fp8_gemm_kernel(
                 uint32_t b_lo = (uint32_t)(b_desc);
                 uint32_t b_hi = (uint32_t)(b_desc >> 32);
 
-                uint32_t idesc = set_sf_ids(base_idesc, sf_idx, sf_idx);
                 uint32_t accum = (kb > 0) ? 1u : 0u;
 
                 if (elect_one()) {
@@ -607,6 +606,8 @@ fp8_gemm_kernel(
                         // lo advances by kk * UMMA_K * sizeof(FP8) / 16 = kk * 2
                         uint64_t da = ((uint64_t)a_hi << 32) | (uint64_t)(a_lo + kk * 2);
                         uint64_t db = ((uint64_t)b_hi << 32) | (uint64_t)(b_lo + kk * 2);
+                        uint32_t umma_sf_idx = (GRAN_K == UMMA_K) ? kk : sf_idx;
+                        uint32_t idesc = set_sf_ids(base_idesc, umma_sf_idx, umma_sf_idx);
 
                         umma_fp8(
                             tmem_base + ai * NUM_M_WAVES * BLOCK_N,

@@ -4,8 +4,8 @@ FP8 GEMM Level 1 — Test & Benchmark
 
 D (BF16, M×N) = A (FP8 E4M3, M×K) × B^T (FP8 E4M3, N×K)
 
-Scale factors: UE8M0 format (4 E8M0 values packed per int32).
-For this level, all scale factors are set to 1.0 (E8M0 value 0x7F = 127).
+Scale factors use the kernel's GRAN_K setting and are stored as
+UE8M0 values (4 E8M0 bytes packed into one int32).
 """
 
 import os
@@ -61,13 +61,72 @@ def load_lib():
 # ============================================================================
 
 GRAN_K = 128
+SF_PACK_WIDTH = 4
+MXFP8_BLOCK_K = 32
+
+def pack_scale_factors(scale_groups):
+    """Pack 4 E8M0 values into one int32 for the kernel."""
+    num_rows, num_groups = scale_groups.shape
+    sf_k = (num_groups + SF_PACK_WIDTH - 1) // SF_PACK_WIDTH
+
+    padded = torch.ones(
+        num_rows, sf_k * SF_PACK_WIDTH, dtype=torch.float32, device=scale_groups.device
+    )
+    padded[:, :num_groups] = scale_groups
+
+    scale_bytes = (
+        padded.to(torch.float8_e8m0fnu)
+        .view(torch.uint8)
+        .view(num_rows, sf_k, SF_PACK_WIDTH)
+    )
+    packed_scales = (
+        scale_bytes[..., 0].to(torch.int32)
+        | (scale_bytes[..., 1].to(torch.int32) << 8)
+        | (scale_bytes[..., 2].to(torch.int32) << 16)
+        | (scale_bytes[..., 3].to(torch.int32) << 24)
+    )
+    return packed_scales.transpose(0, 1).contiguous()
+
+def pack_scaled_mm_scales(scale_groups):
+    """Pack logical 1x32 scale blocks for torch._scaled_mm."""
+    rows, cols = scale_groups.shape
+    n_row_blocks = (rows + 127) // 128
+    n_col_blocks = (cols + SF_PACK_WIDTH - 1) // SF_PACK_WIDTH
+
+    padded_rows = n_row_blocks * 128
+    padded_cols = n_col_blocks * SF_PACK_WIDTH
+
+    padded = torch.zeros(
+        (padded_rows, padded_cols),
+        dtype=torch.float8_e8m0fnu,
+        device=scale_groups.device,
+    )
+    padded[:rows, :cols] = scale_groups.to(torch.float8_e8m0fnu)
+
+    blocks = padded.view(n_row_blocks, 128, n_col_blocks, SF_PACK_WIDTH).permute(
+        0, 2, 1, 3
+    )
+    rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
+    return rearranged.flatten().contiguous()
+
+def create_scale_tensors(num_rows, K, device="cuda"):
+    """Create simple scale factors that vary across GRAN_K blocks."""
+    num_groups = (K + GRAN_K - 1) // GRAN_K
+    pattern = torch.tensor([1.0, 2.0, 4.0, 8.0], dtype=torch.float32, device=device)
+    scale_groups = pattern.repeat((num_groups + SF_PACK_WIDTH - 1) // SF_PACK_WIDTH)[:num_groups]
+    scale_groups = scale_groups.unsqueeze(0).expand(num_rows, -1).contiguous()
+
+    kernel_scales = pack_scale_factors(scale_groups)
+
+    repeats = GRAN_K // MXFP8_BLOCK_K
+    num_groups_32 = (K + MXFP8_BLOCK_K - 1) // MXFP8_BLOCK_K
+    scaled_mm_groups = scale_groups.repeat_interleave(repeats, dim=1)[:, :num_groups_32]
+    scaled_mm_scales = pack_scaled_mm_scales(scaled_mm_groups)
+
+    return kernel_scales, scaled_mm_scales
 
 def create_test_data(M, N, K, device="cuda"):
-    """Create FP8 matrices and scale factors.
-
-    For Level 1, all scale factors = 1.0 (UE8M0 value 127 = 0x7F).
-    This means the GEMM output should match float(A_fp8) @ float(B_fp8)^T.
-    """
+    """Create FP8 matrices and block scales matching matmul.cu."""
     # Random FP8 E4M3 matrices
     # Generate small float values, then cast to FP8
     A_fp32 = torch.randn(M, K, device=device) * 0.1
@@ -75,21 +134,23 @@ def create_test_data(M, N, K, device="cuda"):
     A = A_fp32.to(torch.float8_e4m3fn).contiguous()
     B = B_fp32.to(torch.float8_e4m3fn).contiguous()
 
-    # Scale factors: all 1.0
-    # UE8M0 value 0x7F = 127 means 2^(127-127) = 1.0
-    # Pack 4 E8M0 values per int32: 0x7F7F7F7F
-    sf_k = (K + GRAN_K * 4 - 1) // (GRAN_K * 4)
-    SFA = torch.full((sf_k, M), 0x7F7F7F7F, dtype=torch.int32, device=device).contiguous()
-    SFB = torch.full((sf_k, N), 0x7F7F7F7F, dtype=torch.int32, device=device).contiguous()
+    SFA, scale_a = create_scale_tensors(M, K, device=device)
+    SFB, scale_b = create_scale_tensors(N, K, device=device)
 
     # Output
     D = torch.zeros(M, N, dtype=torch.bfloat16, device=device).contiguous()
 
-    return A, B, SFA, SFB, D
+    return A, B, SFA, SFB, D, scale_a, scale_b
 
-def reference_matmul(A_fp8, B_fp8):
-    """Compute reference: float(A) @ float(B)^T"""
-    return torch.matmul(A_fp8.float(), B_fp8.float().T)
+def reference_matmul(A_fp8, B_fp8, scale_a_mxfp8, scale_b_mxfp8):
+    """Compute reference with PyTorch block-scaled matmul."""
+    return torch._scaled_mm(
+        A_fp8,
+        B_fp8.T,
+        scale_a_mxfp8,
+        scale_b_mxfp8,
+        out_dtype=torch.bfloat16,
+    )
 
 # ============================================================================
 # Run kernel
@@ -108,9 +169,10 @@ def run_kernel(lib, A, B, SFA, SFB, D, M, N, K):
 
 def check_correctness(lib, M=1024, N=1024, K=1024):
     print(f"\n=== Correctness Test: M={M}, N={N}, K={K} ===")
+    print(f"  GRAN_K: {GRAN_K}")
 
-    A, B, SFA, SFB, D = create_test_data(M, N, K)
-    ref = reference_matmul(A, B).bfloat16()
+    A, B, SFA, SFB, D, scale_a, scale_b = create_test_data(M, N, K)
+    ref = reference_matmul(A, B, scale_a, scale_b).bfloat16()
 
     run_kernel(lib, A, B, SFA, SFB, D, M, N, K)
 
@@ -145,7 +207,7 @@ def check_correctness(lib, M=1024, N=1024, K=1024):
 # ============================================================================
 
 def benchmark(lib, M, N, K, warmup=5, iters=20):
-    A, B, SFA, SFB, D = create_test_data(M, N, K)
+    A, B, SFA, SFB, D, _, _ = create_test_data(M, N, K)
 
     # Warmup
     for _ in range(warmup):
